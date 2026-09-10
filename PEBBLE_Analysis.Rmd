@@ -1,0 +1,679 @@
+---
+title: "Data Analysis"
+subtitle: "Gamified Career-Connected Peer-Led Team Learning Improves Academic Performance and Persistence of Male Students in Introductory Psychology"
+date: "2026-09-10"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    df_print: paged
+---
+<style>
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  margin-top: 15px;
+  margin-bottom: 25px;
+}
+
+table th,
+table td {
+  padding: 7px 16px !important;
+}
+
+table th {
+  text-align: center;
+}
+
+table td:first-child {
+  text-align: left;
+}
+</style>
+
+This document reproduces the tables and figures reported in the manuscript. Code for analyses are supressed in the output, but can be reviewed in the PEBBLE_Analysis.Rmd file.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  results = "hide",
+  fig.align = "center",
+  out.width = "100%"
+)
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  psych, tidyr, knitr, dplyr, rstatix, survival, lme4, lmerTest,
+  survminer, ggplot2, effectsize, gridExtra
+)
+
+# ---------- Helpers ----------
+fmt_p <- function(p) {
+  ifelse(is.na(p), "", ifelse(p < .001, "< .001", sprintf("%.3f", p)))
+}
+
+fmt_ms <- function(x, digits = 1) {
+  sprintf(paste0("%.", digits, "f (%.", digits, "f)"),
+          mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+}
+
+fmt_n_pct <- function(x) {
+  n <- sum(x == 1, na.rm = TRUE)
+  pct <- mean(x == 1, na.rm = TRUE) * 100
+  sprintf("%d (%.1f%%)", n, pct)
+}
+
+fmt_yesno <- function(x, value) {
+  n <- sum(x == value, na.rm = TRUE)
+  pct <- mean(x == value, na.rm = TRUE) * 100
+  sprintf("%d (%.1f%%)", n, pct)
+}
+
+cox_row <- function(model, term) {
+  s <- summary(model)$coefficients
+  r <- s[term, , drop = FALSE]
+  se_col <- if ("robust se" %in% colnames(r)) "robust se" else "se(coef)"
+  p_col <- grep("Pr\\(", colnames(r), value = TRUE)[1]
+  data.frame(
+    log_odds = unname(r[1, "coef"]),
+    odds_ratio = exp(unname(r[1, "coef"])),
+    SE = unname(r[1, se_col]),
+    p = unname(r[1, p_col])
+  )
+}
+
+mixed_row <- function(model, term, standardized_model = model) {
+  sm <- summary(model)$coefficients
+  r <- sm[term, , drop = FALSE]
+  p_col <- grep("Pr\\(", colnames(r), value = TRUE)[1]
+  p_val <- if (!is.na(p_col)) unname(r[1, p_col]) else NA_real_
+
+  std <- effectsize::standardize_parameters(standardized_model)
+  beta <- std$Std_Coefficient[match(term, std$Parameter)]
+
+  data.frame(
+    beta = beta,
+    b = unname(r[1, "Estimate"]),
+    SE = unname(r[1, "Std. Error"]),
+    p = p_val
+  )
+}
+
+# ---------- Data import and preparation ----------
+df <- read.csv("OSF_data.csv")
+
+df$Age <- ifelse(df$Age == 100, NA, df$Age)
+df$Age <- ifelse(is.na(df$Age), mean(df$Age, na.rm = TRUE), df$Age)
+
+df <- df %>%
+  mutate(
+    first_year = case_when(
+      Semester_Statues %in% c("First semester", "Second semester") ~ "First year",
+      TRUE ~ "Not First Year"
+    ),
+    No_Gender = ifelse(Male == 0 & Female == 0 & Another_Gender_Identity == 0, 1, 0),
+    Gender_Unknown_Prefer = ifelse(
+      Gender_Prefer_not_to_Respond == 1 | Gender_No_Response == 1 | No_Gender == 1, 1, 0
+    ),
+    Race_Unknown_Prefer = ifelse(
+      Demo_Prefer_No_Response == 1 | Demo_Unknown == 1 | Demo_No_Response == 1, 1, 0
+    )
+  )
+
+pebble <- df %>% filter(Pebble == 1)
+comparison <- df %>% filter(Pebble == 0)
+
+# ---------- Assignment data ----------
+# Noba
+df$NOBA_Wk_NO_sum <- df %>%
+  select(starts_with("Noba") & ends_with("NO")) %>%
+  rowSums(na.rm = TRUE)
+df$NOBA_Wk_Com_sum <- 9 - df$NOBA_Wk_NO_sum
+
+Na_noba_df <- df %>% filter(is.na(Noba_wk3_NO))
+noba_df <- df %>% filter(!(SUBJID %in% Na_noba_df$SUBJID))
+
+noba_long <- noba_df %>%
+  pivot_longer(
+    cols = c(Noba_wk2_NO, Noba_wk3_NO, Noba_wk5_NO, Noba_wk7_NO,
+             Noba_wk8_NO, Noba_wk9_NO, Noba_wk10_NO, Noba_wk13_NO, Noba_wk14_NO),
+    names_to = "Noba_Week",
+    values_to = "Did_Not_Complete"
+  ) %>%
+  mutate(
+    Week_numeric = case_when(
+      Noba_Week == "Noba_wk2_NO" ~ 1,
+      Noba_Week == "Noba_wk3_NO" ~ 2,
+      Noba_Week == "Noba_wk5_NO" ~ 3,
+      Noba_Week == "Noba_wk7_NO" ~ 4,
+      Noba_Week == "Noba_wk8_NO" ~ 5,
+      Noba_Week == "Noba_wk9_NO" ~ 6,
+      Noba_Week == "Noba_wk10_NO" ~ 7,
+      Noba_Week == "Noba_wk13_NO" ~ 8,
+      Noba_Week == "Noba_wk14_NO" ~ 9
+    )
+  ) %>%
+  filter(!is.na(Did_Not_Complete))
+
+part_level_noba <- noba_long %>%
+  group_by(SUBJID, section_type, Male, Female) %>%
+  summarise(num_completed = 9 - sum(Did_Not_Complete), .groups = "drop")
+
+# Qualtrics
+df$hws_completed <- df %>%
+  select(HW1_Completed, HW2_Finished, HW3_Finished, HW4_Finished, HW5_Finished,
+         HW6_Finished, HW7_Finished, HW8_Finished, HW9_Finished) %>%
+  rowSums(na.rm = TRUE)
+
+qualtrics_long <- df %>%
+  pivot_longer(
+    cols = c(HW1_Completed, HW2_Finished, HW3_Finished, HW4_Finished, HW5_Finished,
+             HW6_Finished, HW7_Finished, HW8_Finished, HW9_Finished),
+    names_to = "Homework",
+    values_to = "Completed"
+  ) %>%
+  mutate(
+    Completed_clean = as.numeric(is.na(Completed)),
+    Homework_numeric = case_when(
+      Homework == "HW1_Completed" ~ 1,
+      Homework == "HW2_Finished" ~ 2,
+      Homework == "HW3_Finished" ~ 3,
+      Homework == "HW4_Finished" ~ 4,
+      Homework == "HW5_Finished" ~ 5,
+      Homework == "HW6_Finished" ~ 6,
+      Homework == "HW7_Finished" ~ 7,
+      Homework == "HW8_Finished" ~ 8,
+      Homework == "HW9_Finished" ~ 9
+    )
+  )
+
+part_level_qualtrics <- qualtrics_long %>%
+  group_by(SUBJID, section_type, Male, Female) %>%
+  summarise(num_completed = 9 - sum(Completed_clean), .groups = "drop")
+
+# Excel
+df <- df %>%
+  mutate(across(
+    c(Qualtrics.1, Qualtrics.2, Qualtrics.3, Qualtrics.3G, Qualtrics.4, Qualtrics.4G,
+      Qualtrics.5, Qualtrics.5G, Qualtrics.6, Qualtrics.7, Qualtrics.7G,
+      Qualtrics.8, Qualtrics.8G, Qualtrics.9, Qualtrics.9G),
+    as.character
+  ))
+
+Na_excel_df <- df %>%
+  filter(is.na(Qualtrics.1) & is.na(Qualtrics.3G) & is.na(Qualtrics.4G) &
+           is.na(Qualtrics.5G) & is.na(Qualtrics.7G) & is.na(Qualtrics.8G) &
+           is.na(Qualtrics.9G) & is.na(projects_percent))
+
+excel_df <- df %>% filter(!(SUBJID %in% Na_excel_df$SUBJID))
+
+excel_long <- excel_df %>%
+  pivot_longer(
+    cols = c(Qualtrics.1, Qualtrics.2, Qualtrics.3, Qualtrics.3G, Qualtrics.4,
+             Qualtrics.4G, Qualtrics.5, Qualtrics.5G, Qualtrics.6, Qualtrics.7,
+             Qualtrics.7G, Qualtrics.8, Qualtrics.8G, Qualtrics.9, Qualtrics.9G),
+    names_to = "Qualtrics_Assignment",
+    values_to = "Score"
+  ) %>%
+  mutate(
+    Score = as.numeric(Score),
+    Did_Not_Complete = ifelse(Score == 0, 1, 0)
+  ) %>%
+  filter(Qualtrics_Assignment == "Qualtrics.1" | grepl("G", Qualtrics_Assignment)) %>%
+  mutate(
+    Time_numeric = case_when(
+      Qualtrics_Assignment == "Qualtrics.1" ~ 0,
+      Qualtrics_Assignment == "Qualtrics.3G" ~ 1,
+      Qualtrics_Assignment == "Qualtrics.4G" ~ 2,
+      Qualtrics_Assignment == "Qualtrics.5G" ~ 3,
+      Qualtrics_Assignment == "Qualtrics.7G" ~ 4,
+      Qualtrics_Assignment == "Qualtrics.8G" ~ 5,
+      Qualtrics_Assignment == "Qualtrics.9G" ~ 6
+    ),
+    Did_Not_Complete = ifelse(is.na(Did_Not_Complete), 1, Did_Not_Complete),
+    Did_Not_Complete = ifelse(Qualtrics_Assignment == "Qualtrics.1", 0, Did_Not_Complete)
+  )
+
+part_level_excel <- excel_long %>%
+  group_by(SUBJID, section_type, Male, Female) %>%
+  summarise(num_completed = 6 - sum(Did_Not_Complete), .groups = "drop")
+
+# ---------- Statistical models ----------
+# Table 3
+noba_main <- coxph(
+  Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+  data = noba_long, id = SUBJID
+)
+qualtrics_main <- coxph(
+  Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+  data = qualtrics_long, id = SUBJID
+)
+excel_main <- coxph(
+  Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+  data = excel_long, id = SUBJID
+)
+
+# Table 4
+noba_int <- coxph(
+  Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type * Male,
+  data = noba_long, id = SUBJID
+)
+qualtrics_int <- coxph(
+  Surv(Homework_numeric, Completed_clean == 1) ~ section_type * Male,
+  data = qualtrics_long, id = SUBJID
+)
+excel_int <- coxph(
+  Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type * Male,
+  data = excel_long, id = SUBJID
+)
+
+# Subgroup Cox models reported in text and represented in figures
+noba_men <- coxph(Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+                  data = noba_long %>% filter(Male == 1), id = SUBJID)
+noba_women <- coxph(Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+                    data = noba_long %>% filter(Female == 1), id = SUBJID)
+qualtrics_men <- coxph(Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+                       data = qualtrics_long %>% filter(Male == 1), id = SUBJID)
+qualtrics_women <- coxph(Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+                         data = qualtrics_long %>% filter(Female == 1), id = SUBJID)
+excel_men <- coxph(Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+                   data = excel_long %>% filter(Male == 1), id = SUBJID)
+excel_women <- coxph(Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+                     data = excel_long %>% filter(Female == 1), id = SUBJID)
+
+# Table 5
+project_main <- lmer(projects_percent ~ section_type + (1 | section_id), data = df)
+dfw_main <- glmer(DFW ~ Pebble + (1 | Section), data = df, family = binomial())
+gpa_main <- lmer(Cumulative.GPA ~ Pebble + (1 | Section), data = df)
+
+# Table 6
+project_int <- lmer(projects_percent ~ section_type * Male + (1 | section_id), data = df)
+dfw_int <- glmer(DFW ~ Pebble * Male + (1 | Section), data = df, family = binomial())
+gpa_int <- lmer(Cumulative.GPA ~ Pebble * Male + (1 | Section), data = df)
+```
+
+# Table 1
+
+```{r table1, results='asis'}
+major_candidates <- c("Psychology_Major", "Psychology.Major", "Psych_Major", "Psych.Major")
+major_col <- major_candidates[major_candidates %in% names(df)][1]
+
+make_demo_col <- function(dat) {
+  base <- c(
+    sprintf("%.1f (%.1f)", mean(dat$Age, na.rm = TRUE), sd(dat$Age, na.rm = TRUE)),
+    "",
+    fmt_n_pct(dat$Male),
+    fmt_n_pct(dat$Female),
+    fmt_n_pct(dat$Another_Gender_Identity),
+    fmt_n_pct(dat$Gender_Unknown_Prefer),
+    "",
+    fmt_n_pct(dat$White),
+    fmt_n_pct(dat$Latinx),
+    fmt_n_pct(dat$Black),
+    fmt_n_pct(dat$Asian),
+    fmt_n_pct(dat$MENA),
+    fmt_n_pct(dat$AIAN),
+    fmt_n_pct(dat$Demo_Other),
+    fmt_n_pct(dat$Race_Unknown_Prefer),
+    "",
+    fmt_yesno(dat$First_Gen_Student, "Yes"),
+    fmt_yesno(dat$First_Gen_Student, "No"),
+    "",
+    sprintf("%d (%.1f%%)", sum(dat$first_year == "First year"),
+            mean(dat$first_year == "First year") * 100),
+    sprintf("%d (%.1f%%)", sum(dat$first_year == "Not First Year"),
+            mean(dat$first_year == "Not First Year") * 100)
+  )
+  if (!is.na(major_col)) {
+    m <- dat[[major_col]]
+    if (is.numeric(m)) {
+      base <- c(base, "", fmt_n_pct(m),
+                sprintf("%d (%.1f%%)", sum(m == 0, na.rm = TRUE), mean(m == 0, na.rm = TRUE) * 100))
+    } else {
+      yes <- tolower(as.character(m)) %in% c("yes", "psychology", "psychology major")
+      base <- c(base, "", sprintf("%d (%.1f%%)", sum(yes, na.rm = TRUE), mean(yes, na.rm = TRUE) * 100),
+                sprintf("%d (%.1f%%)", sum(!yes, na.rm = TRUE), mean(!yes, na.rm = TRUE) * 100))
+    }
+  }
+  base
+}
+
+characteristics <- c(
+  "Age, M (SD)",
+  "Gender, n (%)", "  Male", "  Female", "  Nonbinary", "  Prefer not to respond",
+  "Race/Ethnicity, n (%) (not mutually exclusive)",
+  "  White", "  Hispanic/Latinx", "  Black/African American", "  Asian American",
+  "  Middle Eastern/North African", "  Native American", "  Other",
+  "  Unknown/Prefer not to respond",
+  "First Generation Status: Either Parent Attended College",
+  "  Yes", "  No",
+  "First Year Status", "  Yes", "  No"
+)
+if (!is.na(major_col)) characteristics <- c(characteristics, "Psychology Major", "  Yes", "  No")
+
+table1 <- data.frame(
+  Characteristic = characteristics,
+  `Total` = make_demo_col(df),
+  `PEBBLE` = make_demo_col(pebble),
+  `Comparison` = make_demo_col(comparison),
+  check.names = FALSE
+)
+
+names(table1)[2:4] <- c(
+  sprintf("Total\n(N = %d)", nrow(df)),
+  sprintf("PEBBLE\n(n = %d)", nrow(pebble)),
+  sprintf("Comparison\n(n = %d)", nrow(comparison))
+)
+
+knitr::kable(table1,
+  format = "html",
+  digits = 3,
+  caption = "Table 1. Demographic Breakdown of the analytic sample by course section type")
+```
+
+# Table 2
+
+```{r table2, results='asis'}
+stat_cell <- function(x, pct = FALSE, digits = 1) {
+  if (pct) {
+    sprintf("%.1f%%", mean(x, na.rm = TRUE) * 100)
+  } else {
+    sprintf(paste0("%.", digits, "f (%.", digits, "f)"),
+            mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+  }
+}
+
+get_assignment <- function(dat, section, gender = NULL) {
+  x <- dat %>% filter(section_type == section)
+  if (!is.null(gender)) x <- x %>% filter(.data[[gender]] == 1)
+  x$num_completed
+}
+
+subset_df <- function(section, gender = NULL) {
+  x <- df %>% filter(section_type == section)
+  if (!is.null(gender)) x <- x %>% filter(.data[[gender]] == 1)
+  x
+}
+
+table2 <- data.frame(
+  Assignment = c(
+    "Noba Quizzes (range 0–9)", "Qualtrics HW (range 1–9)",
+    "Excel (range 0–6)", "Projects (range 0–100%)", "DFW rate",
+    "Cumulative GPA (range 0–4)"
+  ),
+  `PEBBLE Total` = c(
+    stat_cell(get_assignment(part_level_noba, "Pebble")),
+    stat_cell(get_assignment(part_level_qualtrics, "Pebble")),
+    stat_cell(get_assignment(part_level_excel, "Pebble")),
+    stat_cell(subset_df("Pebble")$projects_percent * 100),
+    stat_cell(subset_df("Pebble")$DFW, pct = TRUE),
+    stat_cell(subset_df("Pebble")$Cumulative.GPA)
+  ),
+  `PEBBLE Men` = c(
+    stat_cell(get_assignment(part_level_noba, "Pebble", "Male")),
+    stat_cell(get_assignment(part_level_qualtrics, "Pebble", "Male")),
+    stat_cell(get_assignment(part_level_excel, "Pebble", "Male")),
+    stat_cell(subset_df("Pebble", "Male")$projects_percent * 100),
+    stat_cell(subset_df("Pebble", "Male")$DFW, pct = TRUE),
+    stat_cell(subset_df("Pebble", "Male")$Cumulative.GPA)
+  ),
+  `PEBBLE Women` = c(
+    stat_cell(get_assignment(part_level_noba, "Pebble", "Female")),
+    stat_cell(get_assignment(part_level_qualtrics, "Pebble", "Female")),
+    stat_cell(get_assignment(part_level_excel, "Pebble", "Female")),
+    stat_cell(subset_df("Pebble", "Female")$projects_percent * 100),
+    stat_cell(subset_df("Pebble", "Female")$DFW, pct = TRUE),
+    stat_cell(subset_df("Pebble", "Female")$Cumulative.GPA)
+  ),
+  `Comparison Total` = c(
+    stat_cell(get_assignment(part_level_noba, "Matched")),
+    stat_cell(get_assignment(part_level_qualtrics, "Matched")),
+    stat_cell(get_assignment(part_level_excel, "Matched")),
+    stat_cell(subset_df("Matched")$projects_percent * 100),
+    stat_cell(subset_df("Matched")$DFW, pct = TRUE),
+    stat_cell(subset_df("Matched")$Cumulative.GPA)
+  ),
+  `Comparison Men` = c(
+    stat_cell(get_assignment(part_level_noba, "Matched", "Male")),
+    stat_cell(get_assignment(part_level_qualtrics, "Matched", "Male")),
+    stat_cell(get_assignment(part_level_excel, "Matched", "Male")),
+    stat_cell(subset_df("Matched", "Male")$projects_percent * 100),
+    stat_cell(subset_df("Matched", "Male")$DFW, pct = TRUE),
+    stat_cell(subset_df("Matched", "Male")$Cumulative.GPA)
+  ),
+  `Comparison Women` = c(
+    stat_cell(get_assignment(part_level_noba, "Matched", "Female")),
+    stat_cell(get_assignment(part_level_qualtrics, "Matched", "Female")),
+    stat_cell(get_assignment(part_level_excel, "Matched", "Female")),
+    stat_cell(subset_df("Matched", "Female")$projects_percent * 100),
+    stat_cell(subset_df("Matched", "Female")$DFW, pct = TRUE),
+    stat_cell(subset_df("Matched", "Female")$Cumulative.GPA)
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(table2,
+  format = "html",
+  digits = 3,
+  caption = "Table 2. Outcome measures by course section type and gender subgroups")
+```
+
+# Table 3
+
+```{r table3, results='asis'}
+table3 <- bind_rows(
+  cbind(Assignment = sprintf("Noba Quizzes (N = %d)", n_distinct(noba_long$SUBJID)),
+        cox_row(noba_main, "section_typePebble")),
+  cbind(Assignment = sprintf("Qualtrics Homework (N = %d)", n_distinct(qualtrics_long$SUBJID)),
+        cox_row(qualtrics_main, "section_typePebble")),
+  cbind(Assignment = sprintf("Excel Worksheets (N = %d)", n_distinct(excel_long$SUBJID)),
+        cox_row(excel_main, "section_typePebble"))
+) %>%
+  transmute(
+    Assignment,
+    `Log-odds` = sprintf("%.2f", log_odds),
+    `Odds-ratio` = sprintf("%.2f", odds_ratio),
+    SE = sprintf("%.2f", SE),
+    p = fmt_p(p)
+  )
+
+knitr::kable(table3,
+  format = "html",
+  digits = 3,
+  caption = "Table 3. Cox-hazards model predicting learning outcomes based on section type")
+```
+
+# Table 4
+
+```{r table4, results='asis'}
+make_cox_block <- function(label, model, N) {
+  terms <- c("section_typePebble", "Male", "section_typePebble:Male")
+  labels <- c("  Section Type (PEBBLE = 1)", "  Gender (Men = 1)",
+              "  Section Type × Gender")
+  rows <- lapply(terms, function(term) cox_row(model, term)) %>% bind_rows()
+  bind_rows(
+    data.frame(Assignment = sprintf("%s (N = %d)", label, N),
+               log_odds = NA, odds_ratio = NA, SE = NA, p = NA),
+    cbind(Assignment = labels, rows)
+  )
+}
+
+table4 <- bind_rows(
+  make_cox_block("Noba Quizzes", noba_int, n_distinct(noba_long$SUBJID)),
+  make_cox_block("Qualtrics", qualtrics_int, n_distinct(qualtrics_long$SUBJID)),
+  make_cox_block("Excel", excel_int, n_distinct(excel_long$SUBJID))
+) %>%
+  mutate(
+    `Log-odds` = ifelse(is.na(log_odds), "", sprintf("%.2f", log_odds)),
+    `Odds-ratio` = ifelse(is.na(odds_ratio), "", sprintf("%.2f", odds_ratio)),
+    SE = ifelse(is.na(SE), "", sprintf("%.2f", SE)),
+    p = fmt_p(p)
+  ) %>%
+  select(Assignment, `Log-odds`, `Odds-ratio`, SE, p)
+
+knitr::kable(table4,
+  format = "html",
+  digits = 3,
+  caption = "Table 4. Cox-hazards model predicting learning outcomes based on section type and gender")
+```
+
+# Table 5
+
+```{r table5, results='asis'}
+table5 <- bind_rows(
+  cbind(Assignment = sprintf("Projects (N = %d)", sum(!is.na(df$projects_percent))),
+        mixed_row(project_main, "section_typePebble")),
+  cbind(Assignment = sprintf("DFW (N = %d)", sum(!is.na(df$DFW))),
+        mixed_row(dfw_main, "Pebble")),
+  cbind(Assignment = sprintf("Cumulative GPA (N = %d)", sum(!is.na(df$Cumulative.GPA))),
+        mixed_row(gpa_main, "Pebble"))
+) %>%
+  transmute(
+    Assignment,
+    beta = sprintf("%.2f", beta),
+    b = sprintf("%.2f", b),
+    SE = sprintf("%.2f", SE),
+    p = fmt_p(p)
+  )
+names(table5)[2] <- "β"
+
+knitr::kable(table5,
+  format = "html",
+  digits = 3,
+  caption = "Table 5. Hierarchical linear models predicting learning outcomes based on section type")
+```
+
+# Table 6
+
+```{r table6, results='asis'}
+make_mixed_block <- function(label, model, terms, labels, N) {
+  rows <- lapply(terms, function(term) mixed_row(model, term)) %>% bind_rows()
+  bind_rows(
+    data.frame(Assignment = sprintf("%s (N = %d)", label, N),
+               beta = NA, b = NA, SE = NA, p = NA),
+    cbind(Assignment = labels, rows)
+  )
+}
+
+project_terms <- c("(Intercept)", "section_typePebble", "Male", "section_typePebble:Male")
+pebble_terms <- c("(Intercept)", "Pebble", "Male", "Pebble:Male")
+row_labels <- c("  (Intercept)", "  Section Type (PEBBLE = 1)",
+                "  Gender (Men = 1)", "  Section Type × Gender")
+
+table6 <- bind_rows(
+  make_mixed_block("Projects", project_int, project_terms, row_labels,
+                   sum(!is.na(df$projects_percent))),
+  make_mixed_block("DFW", dfw_int, pebble_terms, row_labels,
+                   sum(!is.na(df$DFW))),
+  make_mixed_block("Cumulative GPA", gpa_int, pebble_terms, row_labels,
+                   sum(!is.na(df$Cumulative.GPA)))
+) %>%
+  mutate(
+    beta = ifelse(is.na(beta), "", sprintf("%.2f", beta)),
+    b = ifelse(is.na(b), "", sprintf("%.2f", b)),
+    SE = ifelse(is.na(SE), "", sprintf("%.2f", SE)),
+    p = fmt_p(p)
+  ) %>%
+  select(Assignment, beta, b, SE, p)
+names(table6)[2] <- "β"
+
+knitr::kable(table6,
+  format = "html",
+  digits = 3,
+  caption = "Table 6. Hierarchical linear models predicting outcomes based on section type and gender")
+```
+# Figure 2
+
+```{r figure2, fig.width=10, fig.height=4.2}
+df$Grade_converted_plot <- factor(
+  df$Grade_converted,
+  levels = c(0.0, 1.0, 2.0, 2.3, 2.7, 3.0, 3.3, 3.7, 4.0),
+  labels = c("W/F", "D", "C", "C+", "B-", "B", "B+", "A-", "A")
+)
+
+grade_plot <- function(dat, panel_title) {
+  grade_sum <- dat %>% count(Grade_converted_plot)
+  ggplot(grade_sum, aes(x = Grade_converted_plot, y = n)) +
+    geom_col(fill = "black") +
+    labs(x = "Letter Grade", y = "Frequency", title = panel_title) +
+    ylim(0, 350) +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+p_full <- grade_plot(df, "Full sample")
+p_men <- grade_plot(df %>% filter(Male == 1), "Men")
+p_women <- grade_plot(df %>% filter(Female == 1), "Women")
+
+gridExtra::grid.arrange(p_full, p_men, p_women, ncol = 3)
+```
+
+*Figure 2.* Letter grade distribution across the full sample, and separated by gender. 
+
+# Figure 3
+```{r figure3, fig.width=11, fig.height=4}
+noba_surv_all <- survfit(Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+                         data = noba_long)
+noba_surv_men <- survfit(Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+                         data = noba_long %>% filter(Male == 1), id = SUBJID)
+noba_surv_women <- survfit(Surv(Week_numeric, Did_Not_Complete == 1) ~ section_type,
+                           data = noba_long %>% filter(Female == 1), id = SUBJID)
+
+surv_plot <- function(fit, xlab, xlim) {
+  ggsurvplot(
+    fit, conf.int = TRUE, pval = FALSE, risk.table = FALSE,
+    legend.labs = c("Comparison", "PEBBLE"),
+    break.time.by = 1, xlab = xlab, xlim = xlim,
+    ggtheme = theme_minimal(base_size = 12),
+    legend.title = ""
+  )
+}
+
+f3a <- surv_plot(noba_surv_all, "Noba completed", c(1, 9))
+f3b <- surv_plot(noba_surv_men, "Noba completed", c(1, 9))
+f3c <- surv_plot(noba_surv_women, "Noba completed", c(1, 9))
+
+arrange_ggsurvplots(list(f3a, f3b, f3c), ncol = 3, nrow = 1, print = TRUE)
+```
+
+*Figure 3.* Survival curves for Noba quiz completion (n = 415 in PEBBLE sections, n = 397 in comparison sections). Note that students who identified as nonbinary or did not disclose were dropped from the subgroup analyses.
+
+# Figure 4
+
+```{r figure4, fig.width=11, fig.height=4}
+qual_surv_all <- survfit(Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+                         data = qualtrics_long, id = SUBJID)
+qual_surv_men <- survfit(Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+                         data = qualtrics_long %>% filter(Male == 1), id = SUBJID)
+qual_surv_women <- survfit(Surv(Homework_numeric, Completed_clean == 1) ~ section_type,
+                           data = qualtrics_long %>% filter(Female == 1), id = SUBJID)
+
+f4a <- surv_plot(qual_surv_all, "Qualtrics completed", c(1, 9))
+f4b <- surv_plot(qual_surv_men, "Qualtrics completed", c(1, 9))
+f4c <- surv_plot(qual_surv_women, "Qualtrics completed", c(1, 9))
+
+arrange_ggsurvplots(list(f4a, f4b, f4c), ncol = 3, nrow = 1, print = TRUE)
+```
+
+*Figure 4.* Survival curves for Qualtrics HW completion (n = 418 in PEBBLE sections, n = 402 in comparison sections). Note that students who identified as nonbinary or did not disclose were dropped from the subgroup analyses of men and women. 
+
+# Figure 5
+
+```{r figure5, fig.width=11, fig.height=4}
+excel_surv_all <- survfit(Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+                          data = excel_long)
+excel_surv_men <- survfit(Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+                          data = excel_long %>% filter(Male == 1), id = SUBJID)
+excel_surv_women <- survfit(Surv(Time_numeric, Did_Not_Complete == 1) ~ section_type,
+                            data = excel_long %>% filter(Female == 1), id = SUBJID)
+
+f5a <- surv_plot(excel_surv_all, "Excel completed", c(0, 6))
+f5b <- surv_plot(excel_surv_men, "Excel completed", c(0, 6))
+f5c <- surv_plot(excel_surv_women, "Excel completed", c(0, 6))
+
+arrange_ggsurvplots(list(f5a, f5b, f5c), ncol = 3, nrow = 1, print = TRUE)
+```
+
+*Figure 5.* Survival curves for Excel worksheet completion  (n = 415 in PEBBLE sections, n = 397 in comparison sections). Given that some students did not attempt any Excel worksheets, the survival curves start at 0, with the marker at 0 indicating completion of Qualtrics HW1. Students who identified as nonbinary or did not disclose were dropped from the subgroup analyses of men and women. 
