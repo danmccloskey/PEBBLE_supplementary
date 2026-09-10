@@ -1,6 +1,6 @@
 Supplemental Material: Gamified career-connected peer-led team learning improves academic performance and persistence of male students in Introductory Psychology.
 Items:
-1.  Anonymized Course Syllabus
+1.  Anonymized Course Syllabus (PSY100_Sample_Syllabus.pdf)
 2.  Data file of the analytic sample (OSF_data.csv)
 3.  R file to generate data analysis (PEBBLE_Analysis.R)
 4.  R markdown file containing the analysis and directions to render the output (PEBBLE_Analysis.Rmd)
